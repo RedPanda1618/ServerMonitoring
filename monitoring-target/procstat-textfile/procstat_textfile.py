@@ -9,7 +9,6 @@ from typing import Dict, Any, List, Tuple
 
 
 # Helper: sanitize label value per Prometheus exposition format
-# Replace unsupported chars with '_'
 def sanitize(s: str) -> str:
     return "".join(c if c.isalnum() or c in ["_", ":", "-", "."] else "_" for c in s)[
         :200
@@ -17,7 +16,7 @@ def sanitize(s: str) -> str:
 
 
 def read_env() -> Tuple[int, str, int, int, float]:
-    interval = int(os.getenv("INTERVAL_SECONDS", "5"))
+    interval = int(os.getenv("INTERVAL_SECONDS", "1"))
     out_dir = os.getenv("OUTPUT_DIR", "/textfile")
     top_n = int(os.getenv("TOP_N", "0"))  # 0 disables top-n filter
     min_rss = int(os.getenv("MIN_RSS_BYTES", "0"))
@@ -37,61 +36,104 @@ def write_metrics(path: str, lines: List[str]):
     os.replace(tmp, path)
 
 
-def collect_gpu_pmon() -> Dict[int, List[Dict[str, int]]]:
+def collect_gpu_metrics() -> Dict[int, List[Dict[str, int]]]:
+    """
+    pmonからSM/Mem使用率(%)を、query-compute-appsからメモリ使用量(MiB)を取得し、
+    PIDごとにマージして返す。
+    """
+    metrics: Dict[str, Dict[str, int]] = {}  # Key: "pid:gpu_idx", Value: metric dict
+
+    # 1. pmon で SM(%), Mem(%) を取得
     try:
-        # check_output will verify if nvidia-smi exists and runs correctly
+        # -s u (utilization) を指定して明示的に使用率を取得
         out = subprocess.check_output(
-            ["nvidia-smi", "pmon", "-c", "1"], stderr=subprocess.PIPE, text=True
+            ["nvidia-smi", "pmon", "-s", "u", "-c", "1"],
+            stderr=subprocess.DEVNULL,
+            text=True,
         )
-    except FileNotFoundError:
-        print(
-            "Error: nvidia-smi command not found. Is the container configured with GPU capability?"
-        )
-        return {}
-    except subprocess.CalledProcessError as e:
-        print(f"Error: nvidia-smi failed with return code {e.returncode}")
-        print(f"Stderr: {e.stderr}")
-        return {}
-    except Exception as e:
-        print(f"Error running nvidia-smi: {e}")
-        traceback.print_exc()
-        return {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            # 期待フォーマット: gpu pid type sm mem enc dec command
+            if len(parts) < 8:
+                continue
+            if parts[1] == "-":
+                continue  # アイドル行
 
-    gpu_proc: Dict[int, List[Dict[str, int]]] = {}
-
-    lines = out.splitlines()
-
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) < 8:
-            continue
-        try:
-            pid = int(parts[1])
-            gpu_idx = parts[0]
-        except ValueError:
-            continue
-
-        def to_int(x: str) -> int:
             try:
-                return int(x)
-            except Exception:
-                return 0
+                pid = int(parts[1])
+                gpu_idx = parts[0]
 
-        entry = {
-            "gpu": gpu_idx,
-            "sm": to_int(parts[3]),
-            "mem": to_int(parts[4]),
-            "fb": to_int(parts[7]),
-        }
+                # 数値でなければ0
+                def val(x):
+                    return int(x) if x.isdigit() else 0
 
-        if pid not in gpu_proc:
-            gpu_proc[pid] = []
-        gpu_proc[pid].append(entry)
+                key = f"{pid}:{gpu_idx}"
+                metrics[key] = {
+                    "gpu": gpu_idx,
+                    "pid": pid,
+                    "sm": val(parts[3]),
+                    "mem": val(parts[4]),
+                    "fb": 0,  # ここでは取れないので一旦0
+                }
+            except ValueError:
+                continue
+    except Exception:
+        # pmonが失敗しても query-compute-apps で最低限の情報を取るため継続
+        pass
 
-    return gpu_proc
+    # 2. query-compute-apps で FB(MiB) を取得 (これが確実)
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "query-compute-apps",
+                "--format=csv,noheader,nounits",
+                "--query-compute-apps=pid,used_memory,index",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for line in out.splitlines():
+            # CSV: pid, used_memory_mib, gpu_index
+            parts = [s.strip() for s in line.split(",")]
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[0])
+                fb_mib = int(parts[1])
+                gpu_idx = parts[2]
+
+                key = f"{pid}:{gpu_idx}"
+                if key in metrics:
+                    # 既にpmonで見つかっていれば fb を更新
+                    metrics[key]["fb"] = fb_mib
+                else:
+                    # pmonに出てこないがメモリを使っている場合 (Cuda init直後など)
+                    metrics[key] = {
+                        "gpu": gpu_idx,
+                        "pid": pid,
+                        "sm": 0,
+                        "mem": 0,
+                        "fb": fb_mib,
+                    }
+            except ValueError:
+                continue
+    except Exception:
+        pass
+
+    # 結果を整形: Dict[int, List[Dict]]
+    result: Dict[int, List[Dict[str, int]]] = {}
+    for m in metrics.values():
+        pid = m["pid"]
+        entry = {"gpu": m["gpu"], "sm": m["sm"], "mem": m["mem"], "fb": m["fb"]}
+        if pid not in result:
+            result[pid] = []
+        result[pid].append(entry)
+
+    return result
 
 
 def build_metrics(
@@ -100,7 +142,7 @@ def build_metrics(
     ts_ms = int(now * 1000)
     lines: List[str] = []
 
-    # HELP / TYPE
+    # HELP / TYPE definitions
     lines.append("# HELP proc_cpu_percent Process CPU percent over interval")
     lines.append("# TYPE proc_cpu_percent gauge")
     lines.append("# HELP proc_memory_rss_bytes Resident Set Size in bytes")
@@ -212,7 +254,9 @@ def main():
 
             filtered = sorted(filtered, key=keyfn, reverse=True)[:top_n]
 
-        gpu_map = collect_gpu_pmon()
+        # Use new collection function
+        gpu_map = collect_gpu_metrics()
+
         lines = build_metrics(time.time(), filtered, gpu_map)
         write_metrics(out_path, lines)
 
