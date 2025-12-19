@@ -1,0 +1,89 @@
+version: "3.8"
+
+services:
+  fluentd:
+    build: ./fluentd # Add this line (or replace the image line)
+    # image: fluent/fluentd:v1.16.5-debian-1.0 # Comment out or remove this line
+    container_name: fluentd_server
+    volumes:
+      - ./fluentd/conf:/fluentd/etc
+      - ./fluentd/log:/fluentd/log # For Fluentd's own logs
+      - ./fluentd/fluentd_buffer:/fluentd/buffer # For buffer persistence (optional)
+    ports:
+      - "24224:24224" # Receive logs from targets (TCP)
+      - "24224:24224/udp" # (Optional) For receiving via UDP
+    restart: unless-stopped
+    depends_on:
+      - loki
+    user: root # Set Fluentd user to root (if necessary)
+    mem_limit: 1g
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    volumes:
+      - ./loki/config:/etc/loki
+      - ./loki/loki_data:/loki # For Loki data persistence
+    ports:
+      - "3100:3100" # Access from Grafana, writes from Fluentd
+    command: -config.file=/etc/loki/loki-config.yaml
+    restart: unless-stopped
+    user: root
+    mem_limit: 1g
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    volumes:
+      - ./prometheus/config:/etc/prometheus
+      - ./prometheus/prometheus_data:/prometheus # For Prometheus data persistence
+    ports:
+      - "9090:9090" # Access from Grafana, Web UI
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    restart: unless-stopped
+    user: root
+    mem_limit: 1g
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    volumes:
+      - ./grafana/data:/var/lib/grafana # For Grafana data persistence
+      - ./grafana/provisioning:/etc/grafana/provisioning # Provisioning for data sources and dashboards
+      # - ./grafana/config/grafana.ini:/etc/grafana/grafana.ini # (Optional) Advanced Grafana settings
+    ports:
+      - "3000:3000" # Web UI
+    restart: unless-stopped
+    depends_on:
+      - loki
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-change_this_password}
+    user: root
+    mem_limit: 1g
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+volumes:
+  fluentd_buffer:
+  loki_data:
+  prometheus_data:

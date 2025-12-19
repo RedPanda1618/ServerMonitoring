@@ -1,0 +1,6 @@
+-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/nvidia-smi
+-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/docker
+-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/containerd
+-a never,exit -F arch=b64 -S execve -F exe=/usr/bin/runc
+-a always,exit -F arch=b64 -S execve -k command_execution
+-a always,exit -F arch=b32 -S execve -k command_execution

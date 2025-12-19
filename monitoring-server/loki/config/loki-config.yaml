@@ -1,0 +1,74 @@
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096 # It is common to also listen on the gRPC port
+
+common:
+  instance_addr: 127.0.0.1 # Loopback address for a single instance
+  path_prefix: /loki # Base directory where Loki stores data (inside the container)
+  storage:
+    filesystem: # Use filesystem store for chunks and rule files
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1 # 1 for a single instance
+  ring:
+    kvstore:
+      store: inmemory # Use inmemory store for a single instance
+    # interface_names: [eth0] # (Optional) To bind to a specific network interface. Usually not necessary.
+
+# Ingester settings (default values are generally fine for a single instance, but some are specified explicitly)
+ingester:
+  lifecycler:
+    address: 127.0.0.1 # Match common.instance_addr
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+  # chunk_idle_period: 30m # Default value
+  # max_chunk_age: 1h      # Default value
+  # chunk_target_size: 1536000 # Default approx. 1.5MB
+  # concurrent_flushes: 16   # Default value
+# wal: # Write Ahead Log (WAL) - Recommended for Loki 2.0 and later. Increases data durability.
+#   enabled: true
+#   dir: /loki/wal
+#   flush_on_shutdown: true # (Optional) Flush WAL on shutdown
+#   replay_memory_ceiling: 0 # (Optional) Memory limit for replay. 0 is unlimited.
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+schema_config:
+  configs:
+    - from: "2022-01-01" # Date this configuration becomes effective (a date before Loki's operational start)
+      store: boltdb-shipper # Use boltdb-shipper as the index store
+      object_store: filesystem # Use filesystem as the chunk store
+      schema: v12 # v12 is OK as we are not using structured metadata
+      index:
+        prefix: index_
+        period: 24h
+
+# storage_config provides detailed settings for the stores defined in schema_config
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /loki/boltdb-shipper-active # Location to store active index files
+    cache_location: /loki/boltdb-shipper-cache
+    # shared_store: filesystem # Usually not necessary to specify as object_store is filesystem
+  # filesystem: # Usually not necessary here as it's defined in common.storage.filesystem
+  # directory: /loki/chunks # Specified by common.storage.filesystem.chunks_directory
+
+limits_config:
+  retention_period: 672h # 4 weeks (28 days * 24 hours)
+  allow_structured_metadata: false # When using schema v12 and boltdb-shipper with Loki 2.9.x, disable structured metadata
+
+compactor:
+  working_directory: /loki/compactor # Compactor's working directory
+  compaction_interval: 5m # Compaction process execution interval (default)
+  retention_enabled: true # Enable application of log retention period
+  retention_delete_delay: 2h # Delay from when an item is marked for deletion to when it is actually deleted
+  # retention_delete_worker_count: 150  # (Optional) Try with the default value. Adjust according to resources.
+  delete_request_store: filesystem

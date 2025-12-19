@@ -1,0 +1,30 @@
+apiVersion: 1
+
+deleteDatasources: # If you want to delete existing data sources before provisioning
+  - name: Prometheus
+    orgId: 1
+  - name: Loki
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy # Access via the Grafana server
+    url: http://prometheus:9090 # Service name in docker-compose.yml
+    isDefault: true # Make it the default data source
+    jsonData:
+      timeInterval: "15s" # Recommended scrape interval
+    editable: false # Disable editing from the UI
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100 # Service name in docker-compose.yml
+    jsonData:
+      # You can extract fields from log messages with derivedFields
+      # derivedFields:
+      #   - datasourceUid: self # Reference this Loki data source itself
+      #     matcherRegex: "userId=([^\\s]+)"
+      #     name: userId
+      #     url: "/explore?orgId=1&left=[\"now-1h\",\"now\",\"Loki\",{\"expr\":\"{job=\\\"audit\\\"}\"},{\"ui\":[true,true,true,\"none\"]}]" # Example of a link URL
+      maxLines: 1000 # Maximum number of lines to display in Explore
+    editable: false
