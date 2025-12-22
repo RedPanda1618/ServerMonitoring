@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 import os
 import time
-import psutil
-import datetime
+import sys
 import subprocess
-import traceback
-from typing import Dict, Any, List, Tuple
+from typing import Dict, List, Tuple, Any
+
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+PROCFS_PATH = os.getenv("PROCFS_PATH", "/host/proc")
 
 
 def sanitize(s: str) -> str:
+    if not s:
+        return ""
     return "".join(c if c.isalnum() or c in ["_", ":", "-", "."] else "_" for c in s)[
         :200
     ]
 
 
 def read_env() -> Tuple[int, str, int, int, float]:
-    interval = int(os.getenv("INTERVAL_SECONDS", "1"))
+    interval = int(os.getenv("INTERVAL_SECONDS", "5"))
     out_dir = os.getenv("OUTPUT_DIR", "/textfile")
     top_n = int(os.getenv("TOP_N", "0"))
     min_rss = int(os.getenv("MIN_RSS_BYTES", "0"))
@@ -24,56 +29,157 @@ def read_env() -> Tuple[int, str, int, int, float]:
 
 
 def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
 
 
 def write_metrics(path: str, lines: List[str]):
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        for line in lines:
-            f.write(line + "\n")
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_uid_map() -> Dict[int, str]:
+    mapping = {}
+    try:
+        passwd_path = f"{PROCFS_PATH}/../etc/passwd"
+        if not os.path.exists(passwd_path):
+            passwd_path = "/etc/passwd"
+
+        with open(passwd_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(":")
+                if len(parts) >= 3:
+                    try:
+                        uid = int(parts[2])
+                        user = parts[0]
+                        mapping[uid] = user
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    return mapping
+
+
+def get_process_pids() -> List[str]:
+    pids = []
+    try:
+        with os.scandir(PROCFS_PATH) as it:
+            for entry in it:
+                if entry.is_dir() and entry.name.isdigit():
+                    pids.append(entry.name)
+    except Exception:
+        pass
+    return pids
+
+
+def read_file_content(path: str) -> str:
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return ""
+
+
+def get_process_info(pid: str, uid_map: Dict[int, str]) -> Dict[str, Any]:
+    proc_dir = f"{PROCFS_PATH}/{pid}"
+
+    comm = read_file_content(f"{proc_dir}/comm")
+    if not comm:
+        return {}
+
+    cmdline_raw = read_file_content(f"{proc_dir}/cmdline")
+    cmd_parts = cmdline_raw.split("\0")
+    exe = comm
+    if len(cmd_parts) > 0 and cmd_parts[0]:
+        exe = cmd_parts[0]
+
+    uid = "unknown"
+    username = "unknown"
+    try:
+        stat_info = os.stat(proc_dir)
+        uid_val = stat_info.st_uid
+        username = uid_map.get(uid_val, str(uid_val))
+    except OSError:
+        pass
+
+    rss_bytes = 0
+    statm = read_file_content(f"{proc_dir}/statm")
+    if statm:
+        parts = statm.split()
+        if len(parts) >= 2:
+            try:
+                rss_pages = int(parts[1])
+                rss_bytes = rss_pages * PAGE_SIZE
+            except ValueError:
+                pass
+
+    stat_content = read_file_content(f"{proc_dir}/stat")
+    total_time_ticks = 0
+    if stat_content:
+        rpar_idx = stat_content.rfind(")")
+        if rpar_idx != -1:
+            rest = stat_content[rpar_idx + 1 :].strip()
+            fields = rest.split()
+            if len(fields) >= 14:
+                try:
+                    utime = int(fields[11])
+                    stime = int(fields[12])
+                    total_time_ticks = utime + stime
+                except ValueError:
+                    pass
+
+    return {
+        "pid": int(pid),
+        "name": sanitize(comm),
+        "username": sanitize(username),
+        "exe": sanitize(exe),
+        "rss": rss_bytes,
+        "cpu_ticks": total_time_ticks,
+    }
 
 
 def collect_gpu_metrics() -> Dict[int, List[Dict[str, int]]]:
     metrics: Dict[str, Dict[str, int]] = {}
-
-    # 1. pmon で SM(%), Mem(%) を取得
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "pmon", "-c", "1"], stderr=subprocess.DEVNULL, text=True
         )
         for line in out.splitlines():
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line or line.startswith("#") or line.startswith("-"):
                 continue
             parts = line.split()
-            if len(parts) < 8:
-                continue  # command列まであるか確認
-            if parts[1] == "-":
+            if len(parts) < 8 or parts[1] == "-":
                 continue
-
             try:
                 pid = int(parts[1])
                 gpu_idx = parts[0]
-
-                def val(x):
-                    return int(x) if x.isdigit() else 0
-
+                sm = int(parts[3]) if parts[3].isdigit() else 0
+                mem = int(parts[4]) if parts[4].isdigit() else 0
                 key = f"{pid}:{gpu_idx}"
                 metrics[key] = {
                     "gpu": gpu_idx,
                     "pid": pid,
-                    "sm": val(parts[3]),
-                    "mem": val(parts[4]),
-                    "fb": 0,  # pmonからは取れないため0
+                    "sm": sm,
+                    "mem": mem,
+                    "fb": 0,
                 }
             except ValueError:
                 continue
     except Exception:
         pass
 
-    # 2. query-compute-apps で FB(MiB) を取得 (これが重要)
     try:
         out = subprocess.check_output(
             [
@@ -93,7 +199,6 @@ def collect_gpu_metrics() -> Dict[int, List[Dict[str, int]]]:
                 pid = int(parts[0])
                 fb_mib = int(parts[1])
                 gpu_idx = parts[2]
-
                 key = f"{pid}:{gpu_idx}"
                 if key in metrics:
                     metrics[key]["fb"] = fb_mib
@@ -113,55 +218,31 @@ def collect_gpu_metrics() -> Dict[int, List[Dict[str, int]]]:
     result: Dict[int, List[Dict[str, int]]] = {}
     for m in metrics.values():
         pid = m["pid"]
-        entry = {"gpu": m["gpu"], "sm": m["sm"], "mem": m["mem"], "fb": m["fb"]}
         if pid not in result:
             result[pid] = []
-        result[pid].append(entry)
+        result[pid].append(m)
     return result
 
 
-def build_metrics(
-    now: float, procs: List[psutil.Process], gpu_map: Dict[int, List[Dict[str, int]]]
+def build_prom_lines(
+    proc_list: List[Dict[str, Any]], gpu_map: Dict[int, List[Dict[str, int]]]
 ) -> List[str]:
-    lines: List[str] = []
-    # HELP definitions
-    lines.append("# HELP proc_cpu_percent Process CPU percent")
-    lines.append("# TYPE proc_cpu_percent gauge")
-    lines.append("# HELP proc_memory_rss_bytes RSS bytes")
-    lines.append("# TYPE proc_memory_rss_bytes gauge")
-    lines.append("# HELP proc_gpu_sm_percent GPU SM util")
-    lines.append("# TYPE proc_gpu_sm_percent gauge")
-    lines.append("# HELP proc_gpu_mem_percent GPU Mem util")
-    lines.append("# TYPE proc_gpu_mem_percent gauge")
-    lines.append("# HELP proc_gpu_fb_mem_mib GPU Framebuffer MiB")
-    lines.append("# TYPE proc_gpu_fb_mem_mib gauge")
+    lines = []
 
     hostname = sanitize(os.uname().nodename)
 
-    for p in procs:
-        try:
-            with p.oneshot():
-                pid = p.pid
-                name = sanitize(p.name() or "")
-                username = sanitize(p.username() or "")
-                cmdline = " ".join(p.cmdline()[:1]) if p.cmdline() else name
-                exe = sanitize(cmdline or name)
-                cpu = getattr(p, "_last_cpu_percent", p.cpu_percent(None))
-                rss = int(p.memory_info().rss)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
+    for p in proc_list:
+        pid = p["pid"]
+        labels = f'pid="{pid}",process="{p["name"]}",user="{p["username"]}",exe="{p["exe"]}",instance="{hostname}"'
 
-        labels = f'pid="{pid}",process="{name}",user="{username}",exe="{exe}",instance="{hostname}"'
-        lines.append(f"proc_cpu_percent{{{labels}}} {cpu}")
-        lines.append(f"proc_memory_rss_bytes{{{labels}}} {rss}")
+        lines.append(f"proc_cpu_percent{{{labels}}} {p['cpu_percent']:.1f}")
+        lines.append(f"proc_memory_rss_bytes{{{labels}}} {p['rss']}")
 
         for g in gpu_map.get(pid, []):
             gpu_labels = f'{labels},gpu="{g.get("gpu", "unknown")}"'
             lines.append(f'proc_gpu_sm_percent{{{gpu_labels}}} {g.get("sm", 0)}')
             lines.append(f'proc_gpu_mem_percent{{{gpu_labels}}} {g.get("mem", 0)}')
-            lines.append(
-                f'proc_gpu_fb_mem_mib{{{gpu_labels}}} {g.get("fb", 0)}'
-            )  # ここが正しく出るようになります
+            lines.append(f'proc_gpu_fb_mem_mib{{{gpu_labels}}} {g.get("fb", 0)}')
 
     return lines
 
@@ -169,39 +250,64 @@ def build_metrics(
 def main():
     interval, out_dir, top_n, min_rss, min_cpu = read_env()
     ensure_dir(out_dir)
-    for p in psutil.process_iter(attrs=[]):
-        try:
-            p.cpu_percent(None)
-        except:
-            pass
+
+    prev_ticks_map = {}
+    prev_time = time.time()
+
+    uid_map = load_uid_map()
+
+    print(
+        f"Starting procstat collector (Host-Procfs Mode). Reading from {PROCFS_PATH}. Interval: {interval}s",
+        flush=True,
+    )
 
     while True:
-        start = time.time()
-        procs = []
-        for p in psutil.process_iter(attrs=["pid", "name", "username"]):
-            procs.append(p)
+        loop_start = time.time()
 
-        time.sleep(0.01)  # CPU計測用待機
+        pids = get_process_pids()
 
-        # CPU/RSS フィルタリング
-        filtered = []
-        for p in procs:
-            try:
-                cpu = p.cpu_percent(None)
-                if min_cpu and cpu < min_cpu:
-                    continue
-                if min_rss and p.memory_info().rss < min_rss:
-                    continue
-                p._last_cpu_percent = cpu
-                filtered.append(p)
-            except:
+        current_procs = []
+        current_ticks_map = {}
+        now_time = time.time()
+        time_delta = now_time - prev_time
+        if time_delta <= 0:
+            time_delta = 0.0001
+
+        for pid_str in pids:
+            info = get_process_info(pid_str, uid_map)
+            if not info:
                 continue
 
-        gpu_map = collect_gpu_metrics()  # 新しい関数を使用
-        lines = build_metrics(time.time(), filtered, gpu_map)
+            pid = info["pid"]
+            current_ticks = info["cpu_ticks"]
+
+            cpu_percent = 0.0
+            if pid in prev_ticks_map:
+                delta_ticks = current_ticks - prev_ticks_map[pid]
+                if delta_ticks >= 0:
+                    cpu_seconds = delta_ticks / CLK_TCK
+                    cpu_percent = (cpu_seconds / time_delta) * 100.0
+
+            current_ticks_map[pid] = current_ticks
+            info["cpu_percent"] = cpu_percent
+
+            if min_cpu > 0 and cpu_percent < min_cpu:
+                continue
+            if min_rss > 0 and info["rss"] < min_rss:
+                continue
+
+            current_procs.append(info)
+
+        prev_ticks_map = current_ticks_map
+        prev_time = now_time
+
+        gpu_map = collect_gpu_metrics()
+        lines = build_prom_lines(current_procs, gpu_map)
         write_metrics(os.path.join(out_dir, "procstats.prom"), lines)
 
-        time.sleep(max(0.0, interval - (time.time() - start)))
+        elapsed = time.time() - loop_start
+        wait_time = max(0.0, interval - elapsed)
+        time.sleep(wait_time)
 
 
 if __name__ == "__main__":
