@@ -2,5 +2,5 @@
 -a never,exit -F arch=b64 -S execve -F exe=/usr/bin/docker
 -a never,exit -F arch=b64 -S execve -F exe=/usr/bin/containerd
 -a never,exit -F arch=b64 -S execve -F exe=/usr/bin/runc
--a always,exit -F arch=b64 -S execve -k command_execution
--a always,exit -F arch=b32 -S execve -k command_execution
+-a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=-1 -k command_execution
+-a always,exit -F arch=b32 -S execve -F auid>=1000 -F auid!=-1 -k command_execution
