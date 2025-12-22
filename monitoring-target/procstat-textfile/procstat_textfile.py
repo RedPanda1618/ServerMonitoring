@@ -5,13 +5,9 @@ import sys
 import subprocess
 from typing import Dict, List, Tuple, Any
 
-# ==========================================
-# 定数・設定
-# ==========================================
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 
-# 変更点: 読み込み先を環境変数で制御（デフォルトは /host/proc）
 PROCFS_PATH = os.getenv("PROCFS_PATH", "/host/proc")
 
 
@@ -50,17 +46,10 @@ def write_metrics(path: str, lines: List[str]):
         pass
 
 
-# ==========================================
-# ユーザー名マッピング
-# ==========================================
 def load_uid_map() -> Dict[int, str]:
     mapping = {}
     try:
-        # ホストのpasswdを読むためにパスを変更
         passwd_path = f"{PROCFS_PATH}/../etc/passwd"
-        # マウント状況によっては /etc/passwd が見えるとは限らないため、
-        # コンテナ内の /etc/passwd (rootのみ) またはホストのマウントを試みる
-        # 安全のため、ここでは「マウントされていれば読む」実装にする
         if not os.path.exists(passwd_path):
             passwd_path = "/etc/passwd"
 
@@ -82,13 +71,9 @@ def load_uid_map() -> Dict[int, str]:
     return mapping
 
 
-# ==========================================
-# /proc (または /host/proc) 読み込み
-# ==========================================
 def get_process_pids() -> List[str]:
     pids = []
     try:
-        # PROCFS_PATH をスキャン
         with os.scandir(PROCFS_PATH) as it:
             for entry in it:
                 if entry.is_dir() and entry.name.isdigit():
@@ -107,7 +92,6 @@ def read_file_content(path: str) -> str:
 
 
 def get_process_info(pid: str, uid_map: Dict[int, str]) -> Dict[str, Any]:
-    # パスを PROCFS_PATH ベースに変更
     proc_dir = f"{PROCFS_PATH}/{pid}"
 
     comm = read_file_content(f"{proc_dir}/comm")
@@ -165,9 +149,6 @@ def get_process_info(pid: str, uid_map: Dict[int, str]) -> Dict[str, Any]:
     }
 
 
-# ==========================================
-# GPU 情報収集
-# ==========================================
 def collect_gpu_metrics() -> Dict[int, List[Dict[str, int]]]:
     metrics: Dict[str, Dict[str, int]] = {}
     try:
@@ -243,23 +224,10 @@ def collect_gpu_metrics() -> Dict[int, List[Dict[str, int]]]:
     return result
 
 
-# ==========================================
-# メインロジック
-# ==========================================
 def build_prom_lines(
     proc_list: List[Dict[str, Any]], gpu_map: Dict[int, List[Dict[str, int]]]
 ) -> List[str]:
     lines = []
-    lines.append("# HELP proc_cpu_percent Process CPU percent")
-    lines.append("# TYPE proc_cpu_percent gauge")
-    lines.append("# HELP proc_memory_rss_bytes RSS bytes")
-    lines.append("# TYPE proc_memory_rss_bytes gauge")
-    lines.append("# HELP proc_gpu_sm_percent GPU SM util")
-    lines.append("# TYPE proc_gpu_sm_percent gauge")
-    lines.append("# HELP proc_gpu_mem_percent GPU Mem util")
-    lines.append("# TYPE proc_gpu_mem_percent gauge")
-    lines.append("# HELP proc_gpu_fb_mem_mib GPU Framebuffer MiB")
-    lines.append("# TYPE proc_gpu_fb_mem_mib gauge")
 
     hostname = sanitize(os.uname().nodename)
 
